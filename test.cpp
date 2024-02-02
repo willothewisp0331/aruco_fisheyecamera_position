@@ -117,11 +117,8 @@ Mat remapImage(const Mat& image, Mat mapx, Mat mapy)
 	return remappedImage;
 }
 
-Mat Detector(Mat image)
+Mat Detector(Mat image, Mat K, Mat D)
 {
-	Mat K = (Mat_<double>(3, 3) << 232.15773862, 0., 239.29255483, 0., 224.65161846, 320.90631547, 0., 0., 1.);
-	Mat D = (Mat_<double>(1, 4) << 0.07505029, -0.05127031, 0.04389267, -0.01600546);
-
 	Mat flipMatrix;
 	vector<int> ids;
 	vector<vector<Point2f>> corners, rejectedCandidates;
@@ -160,12 +157,12 @@ Mat Detector(Mat image)
 		if (!out_border) un_corners.push_back(move(un_corner));
 	}
 
-	aruco::estimatePoseSingleMarkers(un_corners, 0.14, new_mat, Mat::zeros(5, 1, CV_64F), rvecs, tvecs);
+	aruco::estimatePoseSingleMarkers(un_corners, 0.07, new_mat, Mat::zeros(5, 1, CV_64F), rvecs, tvecs);
 	aruco::drawAxis(imageCopy_r, K, D, rvecs[0], tvecs[0], 0.07);*/
 
 	if (ids.size() > 0)
 	{
-		aruco::estimatePoseSingleMarkers(corners, 0.14, K, D, rvecs, tvecs);
+		aruco::estimatePoseSingleMarkers(corners, 0.07, K, D, rvecs, tvecs);
 		for (int i = 0; i < ids.size(); i++)
 		{
 			double fontScale = 0.5;
@@ -393,17 +390,31 @@ int main(int argc, char* argv[])
 
 	RateCounter rateCounter(FOREGROUND_GREEN | FOREGROUND_RED);
 	MSG msg = { 0 };
+
+
 	int num = 0;
 	int img_num = 0;
+	Mat K3 = (Mat_<double>(3, 3) << 232.15773862, 0., 239.29255483, 0., 224.65161846, 320.90631547, 0., 0., 1.);
+	Mat D3 = (Mat_<double>(1, 4) << 0.07505029, -0.05127031, 0.04389267, -0.01600546);
+	Mat K2 = (Mat_<double>(3, 3) << 242.10123445, 0., 238.55286211, 0., 243.5493872, 325.3093086, 0., 0., 1.);
+	Mat D2 = (Mat_<double>(1, 4) << 0.05602751, -0.04683471, 0.01998477, -0.00428105);
+	Mat mapxR, mapyR;
+	string yamlPathR = "./mapsR.yaml";
 	
-	Mat mapx, mapy;
-	string yamlPath = "./mapsR.yaml";
-	
-	FileStorage fs(yamlPath, FileStorage::READ);
+	FileStorage fsR(yamlPathR, FileStorage::READ);
 
-	fs["mapx"] >> mapx;
-	fs["mapy"] >> mapy;
-	fs.release();
+	fsR["mapx"] >> mapxR;
+	fsR["mapy"] >> mapyR;
+	fsR.release();
+
+	Mat mapxL, mapyL;
+	string yamlPathL = "./mapsL.yaml";
+
+	FileStorage fsL(yamlPathL, FileStorage::READ);
+
+	fsL["mapx"] >> mapxL;
+	fsL["mapy"] >> mapyL;
+	fsL.release();
 
 	while (WM_QUIT != msg.message)
 	{
@@ -420,22 +431,29 @@ int main(int argc, char* argv[])
 			Mat image3 = ConvertPixelsToMat(g_pixels3, 640, 480);
 			Mat imageCopy3;
 			
-			/*rotate(image3, imageCopy3, ROTATE_90_CLOCKWISE);
-			imshow("right", imageCopy3);
+			Mat image2 = ConvertPixelsToMat(g_pixels2, 640, 480);
+			Mat imageCopy2;
+			/*rotate(image2, imageCopy2, ROTATE_90_CLOCKWISE);
+			imshow("left", imageCopy2);
 			if (num == 1000) {
-				string filename = "./image/" + to_string(img_num) + ".jpg";
-				imwrite(filename, imageCopy3);
-				cout << "images saved!" << img_num << endl;
+				string filename = "./imageL/" + to_string(img_num) + ".jpg";
+				imwrite(filename, imageCopy2);
+				cout << "imagesL saved!" << img_num << endl;
 				num = 0;
 				img_num++;
 			}
 			num++;*/
 			
 			Mat image3_r, image3_rd;
+			Mat image2_r, image2_rd;
 			//image3_d = Detector(image3);
-			image3_r = remapImage(image3, mapx, mapy);
-			image3_rd = Detector(image3_r);
+			image3_r = remapImage(image3, mapxR, mapyR);
+			image3_rd = Detector(image3_r, K3, D3);
 			imshow("right", image3_rd);
+
+			image2_r = remapImage(image2, mapxL, mapyL);
+			image2_rd = Detector(image2_r, K2, D2);
+			imshow("left", image2_rd);
 			//Mat image3_d = remapper(image3, mapx, mapy);
 			//imshow("right_d", image3_d);
 			Render();
