@@ -99,15 +99,30 @@ Mat ConvertPixelsToMat(dpvr_fisheye_pixel* pixels, int width = 640, int height =
 	return imageMat.clone();
 }
 
+Mat remapImage(const Mat& image, Mat mapx, Mat mapy) 
+{
+	Mat image_r;
+	rotate(image, image_r, ROTATE_90_CLOCKWISE);
+
+	if (mapx.empty() || mapy.empty())
+	{
+		cerr << "Error: mapx or mapy is empty." << endl;
+		return Mat();
+	}
+
+	Mat remappedImage;
+
+	remap(image_r, remappedImage, mapx, mapy, INTER_LINEAR);
+
+	return remappedImage;
+}
+
 Mat Detector(Mat image)
 {
-	Mat K = (Mat_<double>(3, 3) << 158.92757205, 0., 152.07775471, 0., 164.87005228, 203.70307396, 0., 0., 1.);
-	Mat D = (Mat_<double>(1, 4) << -0.09769812, 0.36214841, -0.41720733, 0.15493034);
+	Mat K = (Mat_<double>(3, 3) << 232.15773862, 0., 239.29255483, 0., 224.65161846, 320.90631547, 0., 0., 1.);
+	Mat D = (Mat_<double>(1, 4) << 0.07505029, -0.05127031, 0.04389267, -0.01600546);
 
-	Mat imageCopy, imageCopy_r, flipMatrix;
-	resize(image, imageCopy, Size(400, 300), 0, 0, INTER_LINEAR);
-	rotate(imageCopy, imageCopy_r, ROTATE_90_CLOCKWISE);
-
+	Mat flipMatrix;
 	vector<int> ids;
 	vector<vector<Point2f>> corners, rejectedCandidates;
 	Ptr<aruco::DetectorParameters> parameters;
@@ -117,7 +132,36 @@ Mat Detector(Mat image)
 
 	flipMatrix = (Mat_<double>(3, 3) << 1, 0, 0, 0, -1, 0, 0, 0, -1);
 
-	aruco::detectMarkers(imageCopy_r, aruco_dict, corners, ids);
+	aruco::detectMarkers(image, aruco_dict, corners, ids);
+	
+	
+	/*const int scale = 4;
+	Mat rimg(scale * imageCopy_r.rows, scale * imageCopy_r.cols, imageCopy_r.type());
+	Size new_img_size(rimg.cols, rimg.rows);
+	Mat new_mat = K.clone();
+	new_mat.at<double>(0, 2) = double(new_img_size.width) / 2;
+	new_mat.at<double>(1, 2) = double(new_img_size.height) / 2;
+	vector<vector<Point2f>> un_corners;
+
+	for (int i = 0; i < corners.size(); i++)
+	{
+		vector<Point2f> un_corner;
+		fisheye::undistortPoints(corners, un_corner, K, D, Matx33d::eye(), new_mat);
+
+		bool out_border = false;
+		for (const auto& p : un_corner)
+		{
+			if (p.x < 0 || p.y < 0)
+			{
+				out_border = true;
+				break;
+			}
+		}
+		if (!out_border) un_corners.push_back(move(un_corner));
+	}
+
+	aruco::estimatePoseSingleMarkers(un_corners, 0.14, new_mat, Mat::zeros(5, 1, CV_64F), rvecs, tvecs);
+	aruco::drawAxis(imageCopy_r, K, D, rvecs[0], tvecs[0], 0.07);*/
 
 	if (ids.size() > 0)
 	{
@@ -127,20 +171,23 @@ Mat Detector(Mat image)
 			double fontScale = 0.5;
 			int thickness = 1;
 
-			aruco::drawAxis(imageCopy_r, K, D, rvecs[i], tvecs[i], 0.07);
+			aruco::drawAxis(image, K, D, rvecs[i], tvecs[i], 0.07);
+			aruco::drawDetectedMarkers(image, corners);
+
 			Mat matTmp, matTmpTransposed, test;
 			Rodrigues(rvecs[i], matTmp);
 			transpose(matTmp, matTmpTransposed);
+			cout << matTmp << matTmpTransposed << endl;
 			Vec3f eulerAngles = rotationMatrixToEulerAngles(matTmpTransposed);
 
 			stringstream yawss, pitchss, rollss;
-			yawss << "Yaw: " << fixed << setprecision(1) << eulerAngles[0] * 180.0 / CV_PI;
-			pitchss << "Pitch: " << fixed << setprecision(1) << eulerAngles[1] * 180.0 / CV_PI;
-			rollss << "Roll: " << fixed << setprecision(1) << eulerAngles[2] * 180.0 / CV_PI;
-			string pitchText = pitchss.str(); 
-			string yawText = yawss.str(); 
+			yawss << "vertical: " << setw(5) << fixed << setprecision(1) << eulerAngles[0] * 180.0 / CV_PI;
+			pitchss << "horizontal: " << setw(5) << fixed << setprecision(1) << eulerAngles[1] * 180.0 / CV_PI;
+			rollss << "clockwise: " << setw(5) << fixed << setprecision(1) << eulerAngles[2] * 180.0 / CV_PI;
+			string pitchText = pitchss.str();
+			string yawText = yawss.str();
 			string rollText = rollss.str();
-			
+
 			Size yawTextSize = getTextSize(yawText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
 			Size pitchTextSize = getTextSize(pitchText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
 			Size rollTextSize = getTextSize(rollText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
@@ -157,25 +204,27 @@ Mat Detector(Mat image)
 			Rect rollRect(rollTextOrg.x - rectMargin, rollTextOrg.y - rollTextSize.height - rectMargin,
 				rollTextSize.width + 2 * rectMargin, rollTextSize.height + 2 * rectMargin);
 
-			rectangle(imageCopy_r, yawRect, Scalar(255, 255, 255), -1);
-			rectangle(imageCopy_r, pitchRect, Scalar(255, 255, 255), -1);
-			rectangle(imageCopy_r, rollRect, Scalar(255, 255, 255), -1);
+			rectangle(image, yawRect, Scalar(255, 255, 255), -1);
+			rectangle(image, pitchRect, Scalar(255, 255, 255), -1);
+			rectangle(image, rollRect, Scalar(255, 255, 255), -1);
 
-			putText(imageCopy_r, yawText, yawTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(imageCopy_r, pitchText, pitchTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(imageCopy_r, rollText, rollTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			putText(image, yawText, yawTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			putText(image, pitchText, pitchTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			putText(image, rollText, rollTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
 
-			Vec3d tvecs_flipped = tvecs[0] * -1;
 
-			float tx = tvecs_flipped[0] * 100;
-			float ty = tvecs_flipped[1] * 100;
-			float tz = tvecs_flipped[2] * 100;
+			//right 
+			Mat p = -matTmpTransposed * Mat(tvecs[0]);
+
+			float tx = Point3f(p).x * 100;
+			float ty = Point3f(p).y * 100;
+			float tz = Point3f(p).z * 100;
 			float distance = sqrt(tx * tx + ty * ty + tz * tz);
 
 			stringstream xss, yss, zss, dss;
-			xss << "x: " << fixed << setprecision(2) << tx << " cm";
-			yss << "y: " << fixed << setprecision(2) << ty << " cm";
-			zss << "z: " << fixed << setprecision(2) << tz << " cm";
+			xss << "x: " << setw(5) << fixed << setprecision(2) << tx << " cm";
+			yss << "y: " << setw(5) << fixed << setprecision(2) << ty << " cm";
+			zss << "z: " << setw(5) << fixed << setprecision(2) << tz << " cm";
 			dss << "dist: " << fixed << setprecision(2) << distance << " cm";
 			string xText = xss.str();
 			string yText = yss.str();
@@ -201,23 +250,23 @@ Mat Detector(Mat image)
 			Rect distanceRect(distanceTextOrg.x - rectMargin, distanceTextOrg.y - distanceTextSize.height - rectMargin,
 				distanceTextSize.width + 2 * rectMargin, distanceTextSize.height + 2 * rectMargin);
 
-			rectangle(imageCopy_r, xRect, Scalar(255, 255, 255), -1);
-			rectangle(imageCopy_r, yRect, Scalar(255, 255, 255), -1);
-			rectangle(imageCopy_r, zRect, Scalar(255, 255, 255), -1);
-			rectangle(imageCopy_r, distanceRect, Scalar(255, 255, 255), -1);
+			rectangle(image, xRect, Scalar(255, 255, 255), -1);
+			rectangle(image, yRect, Scalar(255, 255, 255), -1);
+			rectangle(image, zRect, Scalar(255, 255, 255), -1);
+			rectangle(image, distanceRect, Scalar(255, 255, 255), -1);
 
-			putText(imageCopy_r, xText, xTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(imageCopy_r, yText, yTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(imageCopy_r, zText, zTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(imageCopy_r, distanceText, distanceTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			putText(image, xText, xTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			putText(image, yText, yTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			putText(image, zText, zTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			putText(image, distanceText, distanceTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
 		}
 	}
 	else
 	{
-		putText(imageCopy_r, "No detection", cv::Point(30, 64), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 0), 2, LINE_AA);
+		putText(image, "No detection", cv::Point(30, 64), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 0), 2, LINE_AA);
 	}
 
-	return imageCopy_r;
+	return image;
 }
 
 void OnFisheyeImageUpdate(dpvr_Pose* pose, dpvr_fisheye_pixel* imagePixels0, dpvr_fisheye_pixel* imagePixels1, dpvr_fisheye_pixel* imagePixels2, dpvr_fisheye_pixel* imagePixels3)
@@ -238,10 +287,10 @@ void OnFisheyeImageUpdate(dpvr_Pose* pose, dpvr_fisheye_pixel* imagePixels0, dpv
 	//	}, pixels);
 
 	//thread0.detach();
-	printf("fisheye : time = %lf, position(%lf, %lf, %lf) rotation(%lf, %lf, %lf, %lf) velocity(%lf, %lf, %lf) angularVelocity(%lf, %lf, %lf) acceleration(%lf, %lf, %lf) angularAcceleration(%lf, %lf, %lf)\n",
+	/*printf("fisheye : time = %lf, position(%lf, %lf, %lf) rotation(%lf, %lf, %lf, %lf) velocity(%lf, %lf, %lf) angularVelocity(%lf, %lf, %lf) acceleration(%lf, %lf, %lf) angularAcceleration(%lf, %lf, %lf)\n",
 		pose->hostTimestamp, pose->position.x, pose->position.y, pose->position.z, pose->rotation.w, pose->rotation.x, pose->rotation.y, pose->rotation.z,
 		pose->velocity.x, pose->velocity.y, pose->velocity.z, pose->angularVelocity.x, pose->angularVelocity.y, pose->angularVelocity.z,
-		pose->acceleration.x, pose->acceleration.y, pose->acceleration.z, pose->angularAcceleration.x, pose->angularAcceleration.y, pose->angularAcceleration.z);
+		pose->acceleration.x, pose->acceleration.y, pose->acceleration.z, pose->angularAcceleration.x, pose->angularAcceleration.y, pose->angularAcceleration.z);*/
 
 	static RateCounter rate(FOREGROUND_RED);
 	rate.RunFrame(__FUNCTION__);
@@ -264,10 +313,10 @@ void OnHmdImuUpdated(dpvr_HmdImu* hmdImu)
 	static RateCounter rate(FOREGROUND_GREEN);
 	rate.RunFrame(__FUNCTION__);
 
-	printf("hmdImu : time = %lf, gyro(%lf, %lf, %lf) accel(%lf, %lf, %lf) accelSaturation(%s, %s, %s) magneto(%lf, %lf, %lf) temperature = %lf\n",
+	/*printf("hmdImu : time = %lf, gyro(%lf, %lf, %lf) accel(%lf, %lf, %lf) accelSaturation(%s, %s, %s) magneto(%lf, %lf, %lf) temperature = %lf\n",
 		hmdImu->hostTimestamp, hmdImu->gyro.x, hmdImu->gyro.y, hmdImu->gyro.z, hmdImu->accel.x, hmdImu->accel.y, hmdImu->accel.z,
 		hmdImu->accelSaturation.x ? "true" : "false", hmdImu->accelSaturation.y ? "true" : "false", hmdImu->accelSaturation.z ? "true" : "false",
-		hmdImu->magneto.x, hmdImu->magneto.y, hmdImu->magneto.z, hmdImu->temperature);
+		hmdImu->magneto.x, hmdImu->magneto.y, hmdImu->magneto.z, hmdImu->temperature); */
 }
 
 int main1()
@@ -344,6 +393,18 @@ int main(int argc, char* argv[])
 
 	RateCounter rateCounter(FOREGROUND_GREEN | FOREGROUND_RED);
 	MSG msg = { 0 };
+	int num = 0;
+	int img_num = 0;
+	
+	Mat mapx, mapy;
+	string yamlPath = "./mapsR.yaml";
+	
+	FileStorage fs(yamlPath, FileStorage::READ);
+
+	fs["mapx"] >> mapx;
+	fs["mapy"] >> mapy;
+	fs.release();
+
 	while (WM_QUIT != msg.message)
 	{
 		if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -357,9 +418,24 @@ int main(int argc, char* argv[])
 			UpdateTexture(g_pixels0, g_pixels1, g_pixels2, g_pixels3);
 			imageLocker.unlock();
 			Mat image3 = ConvertPixelsToMat(g_pixels3, 640, 480);
-
-			Mat image3_d = Detector(image3); 
-			imshow("right", image3_d);
+			Mat imageCopy3;
+			
+			/*rotate(image3, imageCopy3, ROTATE_90_CLOCKWISE);
+			imshow("right", imageCopy3);
+			if (num == 1000) {
+				string filename = "./image/" + to_string(img_num) + ".jpg";
+				imwrite(filename, imageCopy3);
+				cout << "images saved!" << img_num << endl;
+				num = 0;
+				img_num++;
+			}
+			num++;*/
+			
+			Mat image3_r, image3_rd;
+			//image3_d = Detector(image3);
+			image3_r = remapImage(image3, mapx, mapy);
+			image3_rd = Detector(image3_r);
+			imshow("right", image3_rd);
 			//Mat image3_d = remapper(image3, mapx, mapy);
 			//imshow("right_d", image3_d);
 			Render();
@@ -376,7 +452,7 @@ int main(int argc, char* argv[])
 
 	fisheyeImage = nullptr;
 
-
+	destroyAllWindows();
 	CleanupDevice();
 
     return 0;
