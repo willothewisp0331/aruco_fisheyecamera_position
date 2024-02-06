@@ -1,9 +1,8 @@
 // DpvrServiceCmdTest.cpp
-#include <thread>
 #include "DpvrSharedFisheyeImage.h"
+#include "output.h"
 using namespace std;
 #include <Windows.h>
-#include <conio.h>
 #include <mutex>
 #include <opencv2/opencv.hpp>
 #include <opencv2/aruco.hpp>
@@ -11,6 +10,9 @@ using namespace std;
 #include <cmath>
 #include <vector>
 #include <iomanip>
+#include <deque>
+#include <algorithm>
+#include <numeric>
 using namespace cv;
 #pragma comment(lib, "Winmm.lib")
 #pragma comment(lib, "C:\\ProgramData\\DPVR Assistant 4\\SDK\\lib\\DpvrSharedFisheyeImage_x64.lib")
@@ -28,7 +30,25 @@ std::mutex imageLocker;
 dpvr_fisheye_pixel* g_pixels0 = new dpvr_fisheye_pixel[640 * 480];
 dpvr_fisheye_pixel* g_pixels1 = new dpvr_fisheye_pixel[640 * 480];
 dpvr_fisheye_pixel* g_pixels2 = new dpvr_fisheye_pixel[640 * 480];
-dpvr_fisheye_pixel* g_pixels3 = new dpvr_fisheye_pixel[640 * 480];
+dpvr_fisheye_pixel* g_pixels3 = new dpvr_fisheye_pixel[640 * 480]; 
+
+deque<Vec3f> angleHistory3, distHistory3;
+deque<Vec3f> angleHistory2, distHistory2;
+int windowSize = 50;
+
+struct DetectionResults
+{
+	Vec3f angles;
+	Vec3f dists;
+	bool detected = false;
+}lastResults3, lastResults2, output;
+
+struct PoseData
+{
+	Vec3f angles;
+	Vec3f dists;
+	//0PoseData(Vec3f orient, Vec3f pos) : angles(orient), dists(pos) {}
+}offsets3, offsets2;
 
 class RateCounter
 {
@@ -59,7 +79,73 @@ public:
 	}
 };
 
-bool isRotationMatrix(const Mat& R)
+Vec3f mean(const deque<Vec3f>& data) // Mean
+{
+	if (data.empty()) {
+		return Vec3f(0, 0, 0);
+	}
+
+	Vec3f sum(0, 0, 0);
+	for (const auto& vec : data) {
+		sum += vec;
+	}
+
+	return sum / static_cast<float>(data.size());
+}
+
+Vec3f stddev(const deque<Vec3f>& data, const Vec3f& mean) // Standard Deviation
+{
+	if (data.size() <= 1) {
+		return Vec3f(0, 0, 0);
+	}
+
+	Vec3f sumSquares(0, 0, 0);
+	for (const auto& vec : data) {
+		Vec3f diff = vec - mean;
+		sumSquares += diff.mul(diff);
+	}
+	return Vec3f(
+		sqrt(sumSquares[0] / (data.size() - 1)), 
+		sqrt(sumSquares[1] / (data.size() - 1)), 
+		sqrt(sumSquares[2] / (data.size() - 1))
+	);
+}
+
+bool updateHistory(deque<Vec3f>& history, const Vec3f& newData)
+{
+	history.push_back(newData);
+	if (history.size() > windowSize)
+	{
+		history.pop_front();
+	}
+	
+	if (history.size() < windowSize) {
+		return false;
+	}
+
+	Vec3f currentMean = mean(history);
+	Vec3f currentStdDev = stddev(history, currentMean);
+
+	bool isOutlier = false;
+
+	for (int i = 0; i < 3; i++)
+	{
+		if (abs(newData[i] - currentMean[i]) > 2 * currentStdDev[i])
+		{
+			isOutlier = true;
+			break;
+		}
+	}
+
+	if (isOutlier)
+	{
+		history.pop_back();
+	}
+
+	return isOutlier;
+}
+
+bool isRotationMatrix(const Mat& R) // Check if Matrix is a Rotation Matrix
 {
 	Mat Rt;
 	transpose(R, Rt);
@@ -68,7 +154,7 @@ bool isRotationMatrix(const Mat& R)
 	return norm(I, shouldBeIdentity) < 1e-6;
 }
 
-Vec3f rotationMatrixToEulerAngles(const Mat& R)
+Vec3f rotationMatrixToEulerAngles(const Mat& R) // Convert rotation Matrix to Angles
 {
 	assert(isRotationMatrix(R));
 
@@ -93,13 +179,13 @@ Vec3f rotationMatrixToEulerAngles(const Mat& R)
 	return Vec3f(x, y, z);
 }
 
-Mat ConvertPixelsToMat(dpvr_fisheye_pixel* pixels, int width = 640, int height = 480)
+Mat ConvertPixelsToMat(dpvr_fisheye_pixel* pixels, int width = 640, int height = 480) // Convert Pixel to Matrix
 {
 	Mat imageMat(height, width, CV_8UC1, pixels);
 	return imageMat.clone();
 }
 
-Mat remapImage(const Mat& image, Mat mapx, Mat mapy) 
+Mat remapImage(const Mat& image, const Mat& mapx, const Mat& mapy) // Remap Fisheye camera to undistorted image
 {
 	Mat image_r;
 	rotate(image, image_r, ROTATE_90_CLOCKWISE);
@@ -117,9 +203,96 @@ Mat remapImage(const Mat& image, Mat mapx, Mat mapy)
 	return remappedImage;
 }
 
-Mat Detector(Mat image, Mat K, Mat D)
+void DrawDetectionResult(Mat& image, DetectionResults results, PoseData offsets) // Draw Detection Result
 {
-	Mat flipMatrix;
+
+	double fontScale = 0.5;
+	int thickness = 1;
+
+	Vec3f eulerAngles = results.angles - offsets.angles;
+	Vec3f dists = results.dists - offsets.dists;
+
+	stringstream yawss, pitchss, rollss;
+	yawss << "vertical: " << setw(5) << fixed << setprecision(1) << eulerAngles[0];
+	pitchss << "horizontal: " << setw(5) << fixed << setprecision(1) << eulerAngles[1];
+	rollss << "clockwise: " << setw(5) << fixed << setprecision(1) << eulerAngles[2];
+	string pitchText = pitchss.str();
+	string yawText = yawss.str();
+	string rollText = rollss.str();
+
+	Size yawTextSize = getTextSize(yawText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
+	Size pitchTextSize = getTextSize(pitchText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
+	Size rollTextSize = getTextSize(rollText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
+
+	Point yawTextOrg(10, 250);
+	Point pitchTextOrg(10, 270);
+	Point rollTextOrg(10, 290);
+
+	int rectMargin = 5;
+	Rect yawRect(yawTextOrg.x - rectMargin, yawTextOrg.y - yawTextSize.height - rectMargin,
+		yawTextSize.width + 2 * rectMargin, yawTextSize.height + 2 * rectMargin);
+	Rect pitchRect(pitchTextOrg.x - rectMargin, pitchTextOrg.y - pitchTextSize.height - rectMargin,
+		pitchTextSize.width + 2 * rectMargin, pitchTextSize.height + 2 * rectMargin);
+	Rect rollRect(rollTextOrg.x - rectMargin, rollTextOrg.y - rollTextSize.height - rectMargin,
+		rollTextSize.width + 2 * rectMargin, rollTextSize.height + 2 * rectMargin);
+
+	rectangle(image, yawRect, Scalar(255, 255, 255), -1);
+	rectangle(image, pitchRect, Scalar(255, 255, 255), -1);
+	rectangle(image, rollRect, Scalar(255, 255, 255), -1);
+
+	putText(image, yawText, yawTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+	putText(image, pitchText, pitchTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+	putText(image, rollText, rollTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+
+	float tx = dists[0];
+	float ty = dists[1];
+	float tz = dists[2];
+	float distance = sqrt(tx * tx + ty * ty + tz * tz);
+
+	stringstream xss, yss, zss, dss;
+	xss << "x: " << setw(5) << fixed << setprecision(2) << tx << " cm";
+	yss << "y: " << setw(5) << fixed << setprecision(2) << ty << " cm";
+	zss << "z: " << setw(5) << fixed << setprecision(2) << tz << " cm";
+	//dss << "dist: " << fixed << setprecision(2) << distance << " cm";
+	string xText = xss.str();
+	string yText = yss.str();
+	string zText = zss.str();
+	//string distanceText = dss.str();
+
+	Size xTextSize = getTextSize(xText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
+	Size yTextSize = getTextSize(yText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
+	Size zTextSize = getTextSize(zText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
+	//Size distanceTextSize = getTextSize(distanceText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
+
+	Point xTextOrg(10, 330);
+	Point yTextOrg(10, 350);
+	Point zTextOrg(10, 370);
+	//Point distanceTextOrg(10, 390);
+
+	Rect xRect(xTextOrg.x - rectMargin, xTextOrg.y - xTextSize.height - rectMargin,
+		xTextSize.width + 2 * rectMargin, xTextSize.height + 2 * rectMargin);
+	Rect yRect(yTextOrg.x - rectMargin, yTextOrg.y - yTextSize.height - rectMargin,
+		yTextSize.width + 2 * rectMargin, yTextSize.height + 2 * rectMargin);
+	Rect zRect(zTextOrg.x - rectMargin, zTextOrg.y - zTextSize.height - rectMargin,
+		zTextSize.width + 2 * rectMargin, zTextSize.height + 2 * rectMargin);
+	//Rect distanceRect(distanceTextOrg.x - rectMargin, distanceTextOrg.y - distanceTextSize.height - rectMargin,
+		//distanceTextSize.width + 2 * rectMargin, distanceTextSize.height + 2 * rectMargin);
+
+	rectangle(image, xRect, Scalar(255, 255, 255), -1);
+	rectangle(image, yRect, Scalar(255, 255, 255), -1);
+	rectangle(image, zRect, Scalar(255, 255, 255), -1);
+	//rectangle(image, distanceRect, Scalar(255, 255, 255), -1);
+
+	putText(image, xText, xTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+	putText(image, yText, yTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+	putText(image, zText, zTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+	//putText(image, distanceText, distanceTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+}
+
+DetectionResults  Detector(Mat& image, const Mat& K, const Mat& D)
+{
+	DetectionResults results;
+
 	vector<int> ids;
 	vector<vector<Point2f>> corners, rejectedCandidates;
 	Ptr<aruco::DetectorParameters> parameters;
@@ -127,135 +300,22 @@ Mat Detector(Mat image, Mat K, Mat D)
 
 	vector<Vec3d> rvecs, tvecs;
 
-	flipMatrix = (Mat_<double>(3, 3) << 1, 0, 0, 0, -1, 0, 0, 0, -1);
-
 	aruco::detectMarkers(image, aruco_dict, corners, ids);
-	
-	
-	/*const int scale = 4;
-	Mat rimg(scale * imageCopy_r.rows, scale * imageCopy_r.cols, imageCopy_r.type());
-	Size new_img_size(rimg.cols, rimg.rows);
-	Mat new_mat = K.clone();
-	new_mat.at<double>(0, 2) = double(new_img_size.width) / 2;
-	new_mat.at<double>(1, 2) = double(new_img_size.height) / 2;
-	vector<vector<Point2f>> un_corners;
-
-	for (int i = 0; i < corners.size(); i++)
-	{
-		vector<Point2f> un_corner;
-		fisheye::undistortPoints(corners, un_corner, K, D, Matx33d::eye(), new_mat);
-
-		bool out_border = false;
-		for (const auto& p : un_corner)
-		{
-			if (p.x < 0 || p.y < 0)
-			{
-				out_border = true;
-				break;
-			}
-		}
-		if (!out_border) un_corners.push_back(move(un_corner));
-	}
-
-	aruco::estimatePoseSingleMarkers(un_corners, 0.07, new_mat, Mat::zeros(5, 1, CV_64F), rvecs, tvecs);
-	aruco::drawAxis(imageCopy_r, K, D, rvecs[0], tvecs[0], 0.07);*/
 
 	if (ids.size() > 0)
 	{
+		results.detected = true;
 		aruco::estimatePoseSingleMarkers(corners, 0.07, K, D, rvecs, tvecs);
-		for (int i = 0; i < ids.size(); i++)
+		for (size_t i = 0; i < ids.size(); i++)
 		{
-			double fontScale = 0.5;
-			int thickness = 1;
-
 			aruco::drawAxis(image, K, D, rvecs[i], tvecs[i], 0.07);
-			aruco::drawDetectedMarkers(image, corners);
-
 			Mat matTmp, matTmpTransposed, test;
 			Rodrigues(rvecs[i], matTmp);
 			transpose(matTmp, matTmpTransposed);
-			cout << matTmp << matTmpTransposed << endl;
 			Vec3f eulerAngles = rotationMatrixToEulerAngles(matTmpTransposed);
-
-			stringstream yawss, pitchss, rollss;
-			yawss << "vertical: " << setw(5) << fixed << setprecision(1) << eulerAngles[0] * 180.0 / CV_PI;
-			pitchss << "horizontal: " << setw(5) << fixed << setprecision(1) << eulerAngles[1] * 180.0 / CV_PI;
-			rollss << "clockwise: " << setw(5) << fixed << setprecision(1) << eulerAngles[2] * 180.0 / CV_PI;
-			string pitchText = pitchss.str();
-			string yawText = yawss.str();
-			string rollText = rollss.str();
-
-			Size yawTextSize = getTextSize(yawText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
-			Size pitchTextSize = getTextSize(pitchText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
-			Size rollTextSize = getTextSize(rollText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
-
-			Point yawTextOrg(10, 250);
-			Point pitchTextOrg(10, 270);
-			Point rollTextOrg(10, 290);
-
-			int rectMargin = 5;
-			Rect yawRect(yawTextOrg.x - rectMargin, yawTextOrg.y - yawTextSize.height - rectMargin,
-				yawTextSize.width + 2 * rectMargin, yawTextSize.height + 2 * rectMargin);
-			Rect pitchRect(pitchTextOrg.x - rectMargin, pitchTextOrg.y - pitchTextSize.height - rectMargin,
-				pitchTextSize.width + 2 * rectMargin, pitchTextSize.height + 2 * rectMargin);
-			Rect rollRect(rollTextOrg.x - rectMargin, rollTextOrg.y - rollTextSize.height - rectMargin,
-				rollTextSize.width + 2 * rectMargin, rollTextSize.height + 2 * rectMargin);
-
-			rectangle(image, yawRect, Scalar(255, 255, 255), -1);
-			rectangle(image, pitchRect, Scalar(255, 255, 255), -1);
-			rectangle(image, rollRect, Scalar(255, 255, 255), -1);
-
-			putText(image, yawText, yawTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(image, pitchText, pitchTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(image, rollText, rollTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-
-
-			//right 
 			Mat p = -matTmpTransposed * Mat(tvecs[0]);
-
-			float tx = Point3f(p).x * 100;
-			float ty = Point3f(p).y * 100;
-			float tz = Point3f(p).z * 100;
-			float distance = sqrt(tx * tx + ty * ty + tz * tz);
-
-			stringstream xss, yss, zss, dss;
-			xss << "x: " << setw(5) << fixed << setprecision(2) << tx << " cm";
-			yss << "y: " << setw(5) << fixed << setprecision(2) << ty << " cm";
-			zss << "z: " << setw(5) << fixed << setprecision(2) << tz << " cm";
-			dss << "dist: " << fixed << setprecision(2) << distance << " cm";
-			string xText = xss.str();
-			string yText = yss.str();
-			string zText = zss.str();
-			string distanceText = dss.str();
-
-			Size xTextSize = getTextSize(xText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
-			Size yTextSize = getTextSize(yText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
-			Size zTextSize = getTextSize(zText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
-			Size distanceTextSize = getTextSize(distanceText, FONT_HERSHEY_SIMPLEX, fontScale, thickness, 0);
-
-			Point xTextOrg(10, 330);
-			Point yTextOrg(10, 350);
-			Point zTextOrg(10, 370);
-			Point distanceTextOrg(10, 390);
-
-			Rect xRect(xTextOrg.x - rectMargin, xTextOrg.y - xTextSize.height - rectMargin,
-				xTextSize.width + 2 * rectMargin, xTextSize.height + 2 * rectMargin);
-			Rect yRect(yTextOrg.x - rectMargin, yTextOrg.y - yTextSize.height - rectMargin,
-				yTextSize.width + 2 * rectMargin, yTextSize.height + 2 * rectMargin);
-			Rect zRect(zTextOrg.x - rectMargin, zTextOrg.y - zTextSize.height - rectMargin,
-				zTextSize.width + 2 * rectMargin, zTextSize.height + 2 * rectMargin);
-			Rect distanceRect(distanceTextOrg.x - rectMargin, distanceTextOrg.y - distanceTextSize.height - rectMargin,
-				distanceTextSize.width + 2 * rectMargin, distanceTextSize.height + 2 * rectMargin);
-
-			rectangle(image, xRect, Scalar(255, 255, 255), -1);
-			rectangle(image, yRect, Scalar(255, 255, 255), -1);
-			rectangle(image, zRect, Scalar(255, 255, 255), -1);
-			rectangle(image, distanceRect, Scalar(255, 255, 255), -1);
-
-			putText(image, xText, xTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(image, yText, yTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(image, zText, zTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
-			putText(image, distanceText, distanceTextOrg, FONT_HERSHEY_SIMPLEX, fontScale, Scalar(0, 0, 0), thickness);
+			results.angles = eulerAngles * 180.0 / CV_PI;
+			results.dists = Vec3f(p)*100;
 		}
 	}
 	else
@@ -263,7 +323,21 @@ Mat Detector(Mat image, Mat K, Mat D)
 		putText(image, "No detection", cv::Point(30, 64), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 0), 2, LINE_AA);
 	}
 
-	return image;
+	return results;
+}
+
+void LoadRemapFiles(const string& yamlPath, Mat& mapx, Mat& mapy)
+{
+	FileStorage fs(yamlPath, FileStorage::READ);
+	if (!fs.isOpened())
+	{
+		cerr << "Error: Could not open." << yamlPath << endl;
+		return;
+	}
+
+	fs["mapx"] >> mapx;
+	fs["mapy"] >> mapy;
+	fs.release();
 }
 
 void OnFisheyeImageUpdate(dpvr_Pose* pose, dpvr_fisheye_pixel* imagePixels0, dpvr_fisheye_pixel* imagePixels1, dpvr_fisheye_pixel* imagePixels2, dpvr_fisheye_pixel* imagePixels3)
@@ -318,8 +392,6 @@ void OnHmdImuUpdated(dpvr_HmdImu* hmdImu)
 
 int main1()
 {
-
-
 	// Main message loop
 	MSG msg = { 0 };
 	while (WM_QUIT != msg.message)
@@ -385,36 +457,27 @@ int main(int argc, char* argv[])
 
 	dpvr_SharedFisheyeImage_OnHmdImuUpdated(fisheyeImage, OnHmdImuUpdated);
 
-
-
-
 	RateCounter rateCounter(FOREGROUND_GREEN | FOREGROUND_RED);
 	MSG msg = { 0 };
 
+	int frameCounter = 0;
 
-	int num = 0;
-	int img_num = 0;
+	// Camera Intrinsic and Extrinsic Matrix
+	// I used chessboard calibration method to get these values
 	Mat K3 = (Mat_<double>(3, 3) << 232.15773862, 0., 239.29255483, 0., 224.65161846, 320.90631547, 0., 0., 1.);
 	Mat D3 = (Mat_<double>(1, 4) << 0.07505029, -0.05127031, 0.04389267, -0.01600546);
 	Mat K2 = (Mat_<double>(3, 3) << 242.10123445, 0., 238.55286211, 0., 243.5493872, 325.3093086, 0., 0., 1.);
 	Mat D2 = (Mat_<double>(1, 4) << 0.05602751, -0.04683471, 0.01998477, -0.00428105);
-	Mat mapxR, mapyR;
-	string yamlPathR = "./mapsR.yaml";
 	
-	FileStorage fsR(yamlPathR, FileStorage::READ);
-
-	fsR["mapx"] >> mapxR;
-	fsR["mapy"] >> mapyR;
-	fsR.release();
-
-	Mat mapxL, mapyL;
-	string yamlPathL = "./mapsL.yaml";
-
-	FileStorage fsL(yamlPathL, FileStorage::READ);
-
-	fsL["mapx"] >> mapxL;
-	fsL["mapy"] >> mapyL;
-	fsL.release();
+	// Remapping fisheye camera to undistorted image
+	Mat mapxR, mapyR, mapxL, mapyL;
+	// file for remapping
+	LoadRemapFiles("./mapsR.yaml", mapxR, mapyR);
+	LoadRemapFiles("./mapsL.yaml", mapxL, mapyL);
+	
+	int reset = 0;
+	
+	PoseData nooffset = { Vec3f(0.0f, 0.0f, 0.0f), Vec3f(0.0f, 0.0f, 0.0f)};
 
 	while (WM_QUIT != msg.message)
 	{
@@ -433,29 +496,64 @@ int main(int argc, char* argv[])
 			
 			Mat image2 = ConvertPixelsToMat(g_pixels2, 640, 480);
 			Mat imageCopy2;
-			/*rotate(image2, imageCopy2, ROTATE_90_CLOCKWISE);
-			imshow("left", imageCopy2);
-			if (num == 1000) {
-				string filename = "./imageL/" + to_string(img_num) + ".jpg";
-				imwrite(filename, imageCopy2);
-				cout << "imagesL saved!" << img_num << endl;
-				num = 0;
-				img_num++;
-			}
-			num++;*/
-			
-			Mat image3_r, image3_rd;
-			Mat image2_r, image2_rd;
-			//image3_d = Detector(image3);
-			image3_r = remapImage(image3, mapxR, mapyR);
-			image3_rd = Detector(image3_r, K3, D3);
-			imshow("right", image3_rd);
+		
+			Mat image3_r;
+			rotate(imageCopy3, image3_r, ROTATE_90_CLOCKWISE);
+			Mat image2_r;
+			rotate(imageCopy2, image2_r, ROTATE_90_CLOCKWISE);
 
+			image3_r = remapImage(image3, mapxR, mapyR);
 			image2_r = remapImage(image2, mapxL, mapyL);
-			image2_rd = Detector(image2_r, K2, D2);
-			imshow("left", image2_rd);
-			//Mat image3_d = remapper(image3, mapx, mapy);
-			//imshow("right_d", image3_d);
+			lastResults3 = Detector(image3_r, K3, D3);
+			lastResults2 = Detector(image2_r, K2, D2);
+
+			if (frameCounter == 10)
+			{
+				lastResults3 = Detector(image3_r, K3, D3);
+				lastResults2 = Detector(image2_r, K2, D2);
+				frameCounter = 0;
+			}
+			else
+			{
+				Detector(image3_r, K3, D3);
+				Detector(image2_r, K2, D2);
+			}
+			frameCounter++;
+
+			if (lastResults2.detected && lastResults3.detected) {
+				// update offset
+				offsets3.angles = lastResults3.angles - (lastResults3.angles + lastResults2.angles) / 2;
+				offsets3.dists = lastResults3.dists - (lastResults3.dists + lastResults2.dists) / 2;
+				offsets2.angles = lastResults2.angles - (lastResults3.angles + lastResults2.angles) / 2;
+				offsets2.dists = lastResults2.dists - (lastResults3.dists + lastResults2.dists) / 2;
+				// output is average of 2 camera
+				output.angles = (lastResults3.angles + lastResults2.angles) / 2;
+				output.dists = (lastResults3.dists + lastResults2.dists) / 2;
+				output.detected = true;
+			}
+			else if (lastResults2.detected) {
+				// using lastest offsets
+				output.angles = lastResults2.angles - offsets2.angles;
+				output.dists = lastResults2.dists - offsets2.dists;
+				output.detected = true;
+			}
+			else if (lastResults3.detected) {
+				// using lastest offsets
+				output.angles = lastResults3.angles - offsets3.angles;
+				output.dists = lastResults3.dists - offsets3.dists;
+				output.detected = true;
+			}
+			else {
+				output.detected = false;
+			}
+			if (output.detected) {
+				DrawDetectionResult(image3_r, output, nooffset);
+				DrawDetectionResult(image2_r, output, nooffset);
+			}
+						
+			imshow("right", image3_r);
+			imshow("left", image2_r);
+						
 			Render();
 
 			rateCounter.RunFrame("render fish eye image");
@@ -470,9 +568,36 @@ int main(int argc, char* argv[])
 
 	fisheyeImage = nullptr;
 
-	destroyAllWindows();
+	cv::destroyAllWindows();
 	CleanupDevice();
 
     return 0;
 }
 
+float GetAngleX() {
+	return output.angles[0];
+}
+
+float GetAngleY() {
+	return output.angles[1];
+}
+
+float GetAngleZ() {
+	return output.angles[2];
+}
+
+float GetDistX() {
+	return output.dists[0];
+}
+
+float GetDistY() {
+	return output.dists[1];
+}
+
+float GetDistZ() {
+	return output.dists[2];
+}
+
+bool GetDetected() {
+	return output.detected;
+}
